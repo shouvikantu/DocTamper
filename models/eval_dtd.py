@@ -18,10 +18,10 @@ from glob import glob
 from PIL import Image
 from tqdm import tqdm
 from torch.autograd import Variable
-from torch.cuda.amp import autocast
+# from torch.cuda.amp import autocast # Commented out for M4
 import segmentation_models_pytorch as smp
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler#need pytorch>1.6
+# from torch.cuda.amp import autocast, GradScaler # Commented out for M4
 from losses import DiceLoss,FocalLoss,SoftCrossEntropyLoss,LovaszLoss
 import albumentations as A
 from dtd import *
@@ -41,11 +41,12 @@ parser.add_argument('--minq', type=int, default=75)
 args = parser.parse_args()
 
 class TamperDataset(Dataset):
-    def __init__(self, roots, mode, minq=95, qtb=90, max_readers=64):
-        self.envs = lmdb.open(roots,max_readers=max_readers,readonly=True,lock=False,readahead=False,meminit=False)
+    def __init__(self, root_path, dataset_name, mode, minq=95, qtb=90, max_readers=64):
+        # Use root_path for LMDB
+        self.envs = lmdb.open(root_path, max_readers=max_readers, readonly=True, lock=False, readahead=False, meminit=False)
         with self.envs.begin(write=False) as txn:
             self.nSamples = int(txn.get('num-samples'.encode('utf-8')))
-        self.max_nums=self.nSamples
+        self.max_nums = self.nSamples
         self.minq = minq
         self.mode = mode
         with open('qt_table.pk','rb') as fpk:
@@ -53,8 +54,11 @@ class TamperDataset(Dataset):
         self.pks = {}
         for k,v in pks.items():
             self.pks[k] = torch.LongTensor(v)
-        with open('pks/'+roots+'_%d.pk'%minq,'rb') as f:
+            
+        # Use dataset_name for the Pickle file
+        with open('pks/'+dataset_name+'_%d.pk'%minq,'rb') as f:
             self.record = pickle.load(f)
+            
         self.hflip = torchvision.transforms.RandomHorizontalFlip(p=1.0)
         self.vflip = torchvision.transforms.RandomVerticalFlip(p=1.0)
         self.totsr = ToTensorV2()
@@ -107,7 +111,9 @@ class TamperDataset(Dataset):
             }
 
 
-test_data = TamperDataset(args.data_root+args.lmdb_name,False,minq=args.minq)
+# Fix: Proper path joining
+full_lmdb_path = os.path.join(args.data_root, args.lmdb_name)
+test_data = TamperDataset(full_lmdb_path, args.lmdb_name, False, minq=args.minq)
 
 
 def get_logger(filename, verbosity=1, name=None):
@@ -187,15 +193,39 @@ class IOUMetric:
         fwavacc = (freq[freq > 0] * iu[freq > 0]).sum()
         return acc, acc_cls, iu, mean_iu, fwavacc
 
-model = seg_dtd('',2).cuda()
-model = torch.nn.DataParallel(model)
+# --- FIX: Dynamic Device Selection for Mac M4 ---
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print(f"Using Apple Silicon (MPS) acceleration.")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+    print(f"Using CUDA acceleration.")
+else:
+    device = torch.device("cpu")
+    print(f"Using CPU.")
 
-def eval_net_dtd(model, test_data, plot=False,device='cuda'):
-    train_loader1 = DataLoader(dataset=test_data, batch_size=6, num_workers=12, shuffle=False)
+model = seg_dtd('', 2).to(device)
+# model = torch.nn.DataParallel(model) # Disabled for single M4 chip execution
+
+def eval_net_dtd(model, test_data, plot=False, device=device):
+    train_loader1 = DataLoader(dataset=test_data, batch_size=6, num_workers=0, shuffle=False) # workers=0 often safer for Mac/MPS debugging
     LovaszLoss_fn=LovaszLoss(mode='multiclass')
     SoftCrossEntropy_fn=SoftCrossEntropyLoss(smooth_factor=0.1)
-    ckpt = torch.load(args.pth,map_location='cpu')
-    model.load_state_dict(ckpt['state_dict'])
+    
+    # --- FIX: Load State Dict Handling for DataParallel mismatch ---
+    print(f"Loading checkpoint from: {args.pth}")
+    ckpt = torch.load(args.pth, map_location='cpu', weights_only=False)
+    
+    # Clean up the state_dict keys if they have 'module.' prefix
+    state_dict = ckpt['state_dict']
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        name = k[7:] if k.startswith('module.') else k # remove `module.`
+        new_state_dict[name] = v
+        
+    model.load_state_dict(new_state_dict)
+    # --------------------------------------------------------------
+    
     model.eval()
     iou=IOUMetric(2)
     precisons = []
@@ -220,6 +250,4 @@ def eval_net_dtd(model, test_data, plot=False,device='cuda'):
         recalls = np.array(recalls).mean()
         print('[val] iou:{} pre:{} rec:{} f1:{}'.format(iu,precisons,recalls,(2*precisons*recalls/(precisons+recalls+1e-8))))
 
-eval_net_dtd(model, test_data)
-
-
+eval_net_dtd(model, test_data, device=device)

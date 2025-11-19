@@ -19,10 +19,10 @@ from glob import glob
 from PIL import Image
 from tqdm import tqdm
 from torch.autograd import Variable
-from torch.cuda.amp import autocast
+# from torch.cuda.amp import autocast  # Commented out for M4
 import segmentation_models_pytorch as smp
 from torch.utils.data import Dataset, DataLoader
-from torch.cuda.amp import autocast, GradScaler#need pytorch>1.6
+# from torch.cuda.amp import autocast, GradScaler # Commented out for M4
 from losses import DiceLoss,FocalLoss,SoftCrossEntropyLoss,LovaszLoss
 from fph import FPH
 import albumentations as A
@@ -35,6 +35,21 @@ from functools import partial
 from segmentation_models_pytorch.base import modules as md
 from typing import Optional, Union, List
 from segmentation_models_pytorch.base import SegmentationModel
+
+# --- FIX 1: Custom GELU to bypass PyTorch 2.6+ compatibility issues ---
+class SafeGELU(nn.Module):
+    def forward(self, input):
+        return F.gelu(input)
+
+# --- FIX 2: Function to recursively patch loaded models ---
+def recursive_replace_gelu(module):
+    for name, child in module.named_children():
+        if isinstance(child, nn.GELU):
+            # Replace the incompatible GELU with our SafeGELU
+            setattr(module, name, SafeGELU())
+        else:
+            # Recurse deeper
+            recursive_replace_gelu(child)
 
 class LayerNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
@@ -78,7 +93,8 @@ class ConvBlock(nn.Module):
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
         self.norm = LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(dim, 4 * dim)
-        self.act = nn.GELU()
+        # Use SafeGELU here as well for new layers
+        self.act = SafeGELU()
         self.pwconv2 = nn.Linear(4 * dim, dim)
         self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), requires_grad=True) if layer_scale_init_value > 0 else None
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -117,6 +133,7 @@ class AddCoords(nn.Module):
 class VPH(nn.Module):
     def __init__(self, dims=[96, 192], drop_path_rate=0.4, layer_scale_init_value=1e-6):
         super().__init__()
+        depths=[2, 2, 6, 2] # Added missing variable definition
         dp_rates=[x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
         self.downsample_layers = nn.ModuleList([nn.Sequential(nn.Conv2d(6, dims[0], kernel_size=4, stride=4), LayerNorm(dims[0], eps=1e-6, data_format="channels_first")), nn.Sequential(LayerNorm(dims[1], eps=1e-6, data_format="channels_first"),nn.Conv2d(dims[1], dims[2], kernel_size=2, stride=2))])
         self.stages = nn.ModuleList([nn.Sequential(*[ConvBlock(dim=dims[0], drop_path=dp_rates[j],layer_scale_init_value=layer_scale_init_value) for j in range(3)]), nn.Sequential(*[ConvBlock(dim=dims[1], drop_path=dp_rates[3 + j],layer_scale_init_value=layer_scale_init_value) for j in range(3)])])
@@ -291,8 +308,23 @@ class MID(nn.Module):
 class DTD(SegmentationModel):
     def __init__(self, encoder_name = "resnet18", decoder_channels = (384, 192, 96, 64), classes = 1):
         super().__init__()
-        self.vph = torch.load('vph_imagenet.pt')
-        self.swin = torch.load('swin_imagenet.pt')
+        
+        # --- MAC M4 FIX: Path handling ---
+        import os
+        model_dir = os.path.dirname(os.path.abspath(__file__))
+        vph_path = os.path.join(model_dir, 'vph_imagenet.pt')
+        swin_path = os.path.join(model_dir, 'swin_imagenet.pt')
+        
+        # --- MAC M4 FIX: Safe Loading ---
+        # Load weights to CPU and allow pickled objects
+        self.vph = torch.load(vph_path, map_location='cpu', weights_only=False)
+        self.swin = torch.load(swin_path, map_location='cpu', weights_only=False)
+        
+        # --- CRITICAL FIX: Patch the loaded models ---
+        # Replaces all incompatible GELU layers with SafeGELU
+        recursive_replace_gelu(self.vph)
+        recursive_replace_gelu(self.swin)
+
         self.fph = FPH()
         self.decoder = MID(encoder_channels=(96, 192, 384, 768), decoder_channels=decoder_channels)
         self.segmentation_head = SegmentationHead(in_channels=decoder_channels[-1], out_channels=classes, upsampling=2.0)
@@ -317,8 +349,7 @@ class seg_dtd(nn.Module):
         super().__init__()
         self.model = DTD(encoder_name=model_name, classes=n_class)
 
-    @autocast()
+    # @autocast() # Disabled for Mac M4
     def forward(self, x, dct, qt):
         x = self.model(x, dct, qt)
         return x
-

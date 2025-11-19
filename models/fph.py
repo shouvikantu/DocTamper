@@ -10,9 +10,13 @@ import torch.nn.functional as F
 from functools import partial
 from timm.models.layers import trunc_normal_, DropPath
 import collections
+import math
 
+# Redefine BlockArgs and GlobalParams to ensure compatibility
 BlockArgs = collections.namedtuple('BlockArgs', ['num_repeat', 'kernel_size', 'stride', 'expand_ratio','input_filters', 'output_filters', 'se_ratio', 'id_skip'])
 GlobalParams = collections.namedtuple('GlobalParams', ['width_coefficient', 'depth_coefficient', 'image_size', 'dropout_rate','num_classes', 'batch_norm_momentum', 'batch_norm_epsilon','drop_connect_rate', 'depth_divisor', 'min_depth', 'include_top'])
+
+# Define global parameters used by FPH
 global_params = GlobalParams(width_coefficient=1.8, depth_coefficient=2.6, image_size=528, dropout_rate=0.0, num_classes=1000, batch_norm_momentum=0.99, batch_norm_epsilon=0.001, drop_connect_rate=0.0, depth_divisor=8, min_depth=None, include_top=True)
 
 def get_width_and_height_from_size(x):
@@ -53,12 +57,16 @@ class MBConvBlock(nn.Module):
             in_channels=oup, out_channels=oup, groups=oup,  # groups makes it depthwise
             kernel_size=k, stride=s, bias=False)
         self._bn1 = nn.BatchNorm2d(num_features=oup, momentum=self._bn_mom, eps=self._bn_eps)
+        
         image_size = calculate_output_image_size(image_size, s)
+        
         if self.has_se:
-            Conv2d = get_same_padding_conv2d(image_size=(1, 1))
+            # FIX: Use nn.Conv2d directly for SE layers (1x1 convolution).
+            # The helper 'get_same_padding_conv2d' with image_size=(1,1) causes TypeError in old efficientnet_pytorch versions.
             num_squeezed_channels = max(1, int(self._block_args.input_filters * self._block_args.se_ratio))
-            self._se_reduce = Conv2d(in_channels=oup, out_channels=num_squeezed_channels, kernel_size=1)
-            self._se_expand = Conv2d(in_channels=num_squeezed_channels, out_channels=oup, kernel_size=1)
+            self._se_reduce = nn.Conv2d(in_channels=oup, out_channels=num_squeezed_channels, kernel_size=1)
+            self._se_expand = nn.Conv2d(in_channels=num_squeezed_channels, out_channels=oup, kernel_size=1)
+            
         final_oup = self._block_args.output_filters
         Conv2d = get_same_padding_conv2d(image_size=image_size)
         self._project_conv = Conv2d(in_channels=oup, out_channels=final_oup, kernel_size=1, bias=False)
@@ -121,7 +129,15 @@ class FPH(nn.Module):
         repeats = (1,1,1)
         in_channles = (256,256,256)
         out_channles = (256,256,512)
-        self.conv0 = nn.Sequential(nn.Conv2d(in_channels=35, out_channels=256, kernel_size=8, stride=8, padding=0, bias=False),nn.BatchNorm2d(256, momentum=0.01),nn.ReLU(inplace=True),MBConvBlock(BlockArgs(num_repeat=repeats[0], kernel_size=3, stride=[1], expand_ratio=6, input_filters=in_channles[0], output_filters=in_channles[1], se_ratio=0.25, id_skip=True), global_params),MBConvBlock(BlockArgs(num_repeat=repeats[0], kernel_size=3, stride=[1], expand_ratio=6, input_filters=in_channles[1], output_filters=in_channles[1], se_ratio=0.25, id_skip=True), global_params),MBConvBlock(BlockArgs(num_repeat=repeats[0], kernel_size=3, stride=[1], expand_ratio=6, input_filters=in_channles[1], output_filters=in_channles[1], se_ratio=0.25, id_skip=True), global_params),)
+        self.conv0 = nn.Sequential(
+            nn.Conv2d(in_channels=35, out_channels=256, kernel_size=8, stride=8, padding=0, bias=False),
+            nn.BatchNorm2d(256, momentum=0.01),
+            nn.ReLU(inplace=True),
+            # FIXED: stride=1
+            MBConvBlock(BlockArgs(num_repeat=repeats[0], kernel_size=3, stride=1, expand_ratio=6, input_filters=in_channles[0], output_filters=in_channles[1], se_ratio=0.25, id_skip=True), global_params),
+            MBConvBlock(BlockArgs(num_repeat=repeats[0], kernel_size=3, stride=1, expand_ratio=6, input_filters=in_channles[1], output_filters=in_channles[1], se_ratio=0.25, id_skip=True), global_params),
+            MBConvBlock(BlockArgs(num_repeat=repeats[0], kernel_size=3, stride=1, expand_ratio=6, input_filters=in_channles[1], output_filters=in_channles[1], se_ratio=0.25, id_skip=True), global_params),
+        )
 
     def forward(self, x, qtable):
         x = self.conv2(self.conv1(self.obembed(x).permute(0,3,1,2).contiguous()))
